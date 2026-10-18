@@ -26,7 +26,6 @@ jobs:
           aws-region: us-east-1
 
       - name: Login to Amazon ECR
-        id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
       - name: Build and push Docker image
@@ -35,5 +34,81 @@ jobs:
           ECR_REPOSITORY: docker-lab
           IMAGE_TAG: ${{ github.sha }}
         run: |
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker build -t "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" .
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+
+      - name: Deploy to EC2 over SSH
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+          EC2_SSH_PRIVATE_KEY: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+          ECR_REGISTRY: 530751149473.dkr.ecr.us-east-1.amazonaws.com
+          ECR_REPOSITORY: docker-lab
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          set -eu
+
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$EC2_SSH_PRIVATE_KEY" > ~/.ssh/ec2_key
+          chmod 600 ~/.ssh/ec2_key
+
+          trap 'rm -f ~/.ssh/ec2_key' EXIT
+
+          ssh-keyscan -H "$EC2_HOST" >> ~/.ssh/known_hosts
+
+          ssh -i ~/.ssh/ec2_key \
+            -o IdentitiesOnly=yes \
+            "$EC2_USER@$EC2_HOST" \
+            "ECR_REGISTRY='$ECR_REGISTRY' ECR_REPOSITORY='$ECR_REPOSITORY' IMAGE_TAG='$IMAGE_TAG' bash -s" <<'REMOTE_SCRIPT'
+          set -eu
+
+          IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+
+          OLD_IMAGE=$(sudo docker inspect \
+            --format='{{.Config.Image}}' my-web 2>/dev/null || true)
+
+          aws ecr get-login-password --region us-east-1 \
+            | sudo docker login \
+              --username AWS \
+              --password-stdin "$ECR_REGISTRY"
+
+          # Pull the new image before replacing the running container.
+          sudo docker pull "$IMAGE"
+
+          # Replace the current container.
+          sudo docker rm -f my-web 2>/dev/null || true
+
+          # Start the new container.
+          if sudo docker run -d \
+            --name my-web \
+            --restart unless-stopped \
+            -p 80:80 \
+            "$IMAGE"; then
+
+            sleep 5
+
+            if curl --fail --silent http://localhost/ >/dev/null; then
+              echo "Deployment successful: $IMAGE"
+              exit 0
+            fi
+          fi
+
+          # Attempt to restore the previous image if deployment fails.
+          echo "Deployment failed. Attempting rollback."
+          sudo docker rm -f my-web 2>/dev/null || true
+
+          if [ -n "$OLD_IMAGE" ]; then
+            sudo docker run -d \
+              --name my-web \
+              --restart unless-stopped \
+              -p 80:80 \
+              "$OLD_IMAGE"
+
+            echo "Rollback attempted using: $OLD_IMAGE"
+          else
+            echo "No previous image was found to restore."
+          fi
+
+          exit 1
+          REMOTE_SCRIPT
