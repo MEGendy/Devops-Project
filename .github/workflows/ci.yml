@@ -47,7 +47,8 @@ jobs:
           IMAGE_TAG: ${{ github.sha }}
         run: |
           set -eu
-
+          set -x
+          trap 'rc=$?; echo "Remote deployment failed at line $LINENO with exit code $rc"' ERR
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
           printf '%s\n' "$EC2_SSH_PRIVATE_KEY" > ~/.ssh/ec2_key
