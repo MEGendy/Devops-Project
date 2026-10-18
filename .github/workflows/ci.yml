@@ -1,10 +1,13 @@
-name: Docker CI and Push to ECR
+
+name: Docker CI/CD to AWS
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
   pull_request:
-    branches: [main]
+    branches:
+      - main
 
 permissions:
   contents: read
@@ -37,86 +40,72 @@ jobs:
           docker build -t "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" .
           docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
 
-      - name: Deploy to EC2 over SSH
+      - name: Deploy to EC2 using SSM
         env:
-          EC2_HOST: ${{ secrets.EC2_HOST }}
-          EC2_USER: ${{ secrets.EC2_USER }}
-          EC2_SSH_PRIVATE_KEY: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+          AWS_REGION: us-east-1
+          EC2_INSTANCE_ID: i-0341f31aeada69cc3
           ECR_REGISTRY: 530751149473.dkr.ecr.us-east-1.amazonaws.com
           ECR_REPOSITORY: docker-lab
           IMAGE_TAG: ${{ github.sha }}
         run: |
           set -eu
-          set -x
-          trap 'rc=$?; echo "Remote deployment failed at line $LINENO with exit code $rc"' ERR
-          mkdir -p ~/.ssh
-          chmod 700 ~/.ssh
-          printf '%s\n' "$EC2_SSH_PRIVATE_KEY" > ~/.ssh/ec2_key
-          chmod 600 ~/.ssh/ec2_key
-
-          trap 'rm -f ~/.ssh/ec2_key' EXIT
-
-          echo "Checking EC2 host-key retrieval..."
-          if ssh-keyscan -T 10 -H "$EC2_HOST" >> ~/.ssh/known_hosts 2>/tmp/keyscan-error.txt; then
-            echo "Host-key retrieval succeeded."
-          else
-            echo "Host-key retrieval failed:"
-            cat /tmp/keyscan-error.txt
-            exit 1
-          fi
-
-          ssh -i ~/.ssh/ec2_key \
-            -o IdentitiesOnly=yes \
-            "$EC2_USER@$EC2_HOST" \
-            "ECR_REGISTRY='$ECR_REGISTRY' ECR_REPOSITORY='$ECR_REPOSITORY' IMAGE_TAG='$IMAGE_TAG' bash -s" <<'REMOTE_SCRIPT'
-          set -eu
 
           IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
 
-          OLD_IMAGE=$(sudo docker inspect \
-            --format='{{.Config.Image}}' my-web 2>/dev/null || true)
+          COMMANDS=$(python3 -c 'import json,sys; print(json.dumps({"commands": [
+            "set -eu",
+            "ECR_REGISTRY=\"530751149473.dkr.ecr.us-east-1.amazonaws.com\"",
+            "IMAGE=\""+sys.argv[1]+"\"",
+            "aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin \"$ECR_REGISTRY\"",
+            "docker pull \"$IMAGE\"",
+            "OLD_IMAGE=$(docker inspect --format=\"{{.Config.Image}}\" my-web 2>/dev/null || true)",
+            "docker rm -f my-web 2>/dev/null || true",
+            "if docker run -d --name my-web --restart unless-stopped -p 80:80 \"$IMAGE\"; then sleep 5; if curl --fail --silent http://localhost/ >/dev/null; then echo \"Deployment successful\"; exit 0; fi; fi",
+            "echo \"Deployment failed; attempting rollback\"",
+            "docker rm -f my-web 2>/dev/null || true",
+            "if [ -n \"$OLD_IMAGE\" ]; then docker run -d --name my-web --restart unless-stopped -p 80:80 \"$OLD_IMAGE\"; else echo \"No previous image available\"; fi",
+            "exit 1"
+          ]}, separators=(",",":"))' "$IMAGE")
 
-          aws ecr get-login-password --region us-east-1 \
-            | sudo docker login \
-              --username AWS \
-              --password-stdin "$ECR_REGISTRY"
+          COMMAND_ID=$(aws ssm send-command \
+            --region "$AWS_REGION" \
+            --instance-ids "$EC2_INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Deploy Docker image from GitHub Actions" \
+            --parameters "$COMMANDS" \
+            --query 'Command.CommandId' \
+            --output text)
 
-          # Pull the new image before replacing the running container.
-          sudo docker pull "$IMAGE"
+          echo "SSM command ID: $COMMAND_ID"
 
-          # Replace the current container.
-          sudo docker rm -f my-web 2>/dev/null || true
+          for attempt in $(seq 1 30); do
+            STATUS=$(aws ssm get-command-invocation \
+              --region "$AWS_REGION" \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$EC2_INSTANCE_ID" \
+              --query 'Status' \
+              --output text 2>/dev/null || true)
 
-          # Start the new container.
-          if sudo docker run -d \
-            --name my-web \
-            --restart unless-stopped \
-            -p 80:80 \
-            "$IMAGE"; then
+            echo "Deployment status: $STATUS"
 
-            sleep 5
+            case "$STATUS" in
+              Success)
+                echo "Deployment completed successfully."
+                exit 0
+                ;;
+              Failed|Cancelled|TimedOut)
+                aws ssm get-command-invocation \
+                  --region "$AWS_REGION" \
+                  --command-id "$COMMAND_ID" \
+                  --instance-id "$EC2_INSTANCE_ID" \
+                  --query '{Status:Status,Output:StandardOutputContent,Error:StandardErrorContent}' \
+                  --output json
+                exit 1
+                ;;
+            esac
 
-            if curl --fail --silent http://localhost/ >/dev/null; then
-              echo "Deployment successful: $IMAGE"
-              exit 0
-            fi
-          fi
+            sleep 10
+          done
 
-          # Attempt to restore the previous image if deployment fails.
-          echo "Deployment failed. Attempting rollback."
-          sudo docker rm -f my-web 2>/dev/null || true
-
-          if [ -n "$OLD_IMAGE" ]; then
-            sudo docker run -d \
-              --name my-web \
-              --restart unless-stopped \
-              -p 80:80 \
-              "$OLD_IMAGE"
-
-            echo "Rollback attempted using: $OLD_IMAGE"
-          else
-            echo "No previous image was found to restore."
-          fi
-
+          echo "Timed out waiting for SSM deployment result."
           exit 1
-          REMOTE_SCRIPT
