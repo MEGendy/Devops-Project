@@ -56,10 +56,15 @@ jobs:
 
           trap 'rm -f ~/.ssh/ec2_key' EXIT
 
-          if ! ssh-keyscan -T 10 -H "$EC2_HOST" >> ~/.ssh/known_hosts; then
-            echo "ERROR: Could not retrieve the EC2 SSH host key."
+          echo "Checking EC2 host-key retrieval..."
+          if ssh-keyscan -T 10 -H "$EC2_HOST" >> ~/.ssh/known_hosts 2>/tmp/keyscan-error.txt; then
+            echo "Host-key retrieval succeeded."
+          else
+            echo "Host-key retrieval failed:"
+            cat /tmp/keyscan-error.txt
             exit 1
           fi
+
           ssh -i ~/.ssh/ec2_key \
             -o IdentitiesOnly=yes \
             "$EC2_USER@$EC2_HOST" \
