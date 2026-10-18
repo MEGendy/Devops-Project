@@ -1,4 +1,3 @@
-
 name: Docker CI/CD to AWS
 
 on:
@@ -37,6 +36,7 @@ jobs:
           ECR_REPOSITORY: docker-lab
           IMAGE_TAG: ${{ github.sha }}
         run: |
+          set -eu
           docker build -t "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" .
           docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
 
@@ -52,27 +52,56 @@ jobs:
 
           IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
 
-          COMMANDS=$(python3 -c 'import json,sys; print(json.dumps({"commands": [
-            "set -eu",
-            "ECR_REGISTRY=\"530751149473.dkr.ecr.us-east-1.amazonaws.com\"",
-            "IMAGE=\""+sys.argv[1]+"\"",
-            "aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin \"$ECR_REGISTRY\"",
-            "docker pull \"$IMAGE\"",
-            "OLD_IMAGE=$(docker inspect --format=\"{{.Config.Image}}\" my-web 2>/dev/null || true)",
-            "docker rm -f my-web 2>/dev/null || true",
-            "if docker run -d --name my-web --restart unless-stopped -p 80:80 \"$IMAGE\"; then sleep 5; if curl --fail --silent http://localhost/ >/dev/null; then echo \"Deployment successful\"; exit 0; fi; fi",
-            "echo \"Deployment failed; attempting rollback\"",
-            "docker rm -f my-web 2>/dev/null || true",
-            "if [ -n \"$OLD_IMAGE\" ]; then docker run -d --name my-web --restart unless-stopped -p 80:80 \"$OLD_IMAGE\"; else echo \"No previous image available\"; fi",
-            "exit 1"
-          ]}, separators=(",",":"))' "$IMAGE")
+          # Encode the remote deployment script so quoting is reliable.
+          cat > deploy.sh <<'REMOTE_SCRIPT'
+          set -eu
+
+          IMAGE="$1"
+          ECR_REGISTRY="530751149473.dkr.ecr.us-east-1.amazonaws.com"
+
+          aws ecr get-login-password --region us-east-1 \
+            | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+
+          # Pull before replacing the current container.
+          docker pull "$IMAGE"
+
+          OLD_IMAGE=$(docker inspect --format='{{.Config.Image}}' my-web 2>/dev/null || true)
+
+          # Replace the container and check the website.
+          docker rm -f my-web 2>/dev/null || true
+
+          if docker run -d --name my-web --restart unless-stopped -p 80:80 "$IMAGE"; then
+            sleep 5
+            if curl --fail --silent http://localhost/ >/dev/null; then
+              echo "Deployment successful: $IMAGE"
+              exit 0
+            fi
+          fi
+
+          # Attempt to restore the previous image on failure.
+          echo "Deployment failed; attempting rollback."
+          docker rm -f my-web 2>/dev/null || true
+
+          if [ -n "$OLD_IMAGE" ]; then
+            docker run -d --name my-web --restart unless-stopped -p 80:80 "$OLD_IMAGE"
+            echo "Rollback attempted: $OLD_IMAGE"
+          else
+            echo "No previous image available to restore."
+          fi
+
+          exit 1
+          REMOTE_SCRIPT
+
+          SCRIPT_B64=$(base64 -w 0 deploy.sh)
+
+          COMMAND_JSON=$(python3 -c 'import json,sys; print(json.dumps({"commands": ["echo " + sys.argv[1] + " | base64 -d > /tmp/deploy.sh", "bash /tmp/deploy.sh " + json.dumps(sys.argv[2])]}))' "$SCRIPT_B64" "$IMAGE")
 
           COMMAND_ID=$(aws ssm send-command \
             --region "$AWS_REGION" \
             --instance-ids "$EC2_INSTANCE_ID" \
             --document-name "AWS-RunShellScript" \
             --comment "Deploy Docker image from GitHub Actions" \
-            --parameters "$COMMANDS" \
+            --parameters "$COMMAND_JSON" \
             --query 'Command.CommandId' \
             --output text)
 
@@ -90,7 +119,12 @@ jobs:
 
             case "$STATUS" in
               Success)
-                echo "Deployment completed successfully."
+                aws ssm get-command-invocation \
+                  --region "$AWS_REGION" \
+                  --command-id "$COMMAND_ID" \
+                  --instance-id "$EC2_INSTANCE_ID" \
+                  --query 'StandardOutputContent' \
+                  --output text
                 exit 0
                 ;;
               Failed|Cancelled|TimedOut)
