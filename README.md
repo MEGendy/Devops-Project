@@ -30,6 +30,36 @@ flowchart TD
     AWS --- ECR
     AWS --- IAM
 ```
+### Terraform Infrastructure
+
+The `terraform/` directory contains the Terraform configuration used to define AWS infrastructure and supporting IAM resources.
+
+**Included files:**
+- `main.tf` — Main infrastructure resources
+- `providers.tf` — Terraform and AWS provider configuration
+- `ec2.tf` — EC2 resources
+- `iam.tf` — IAM resources
+- `github-actions.tf` — GitHub Actions OIDC and ECR permissions
+- `key-pair.tf` — EC2 SSH public key configuration
+- `.terraform.lock.hcl` — Locked provider dependency selections
+
+**Validate the configuration**
+
+Run these commands from the `terraform/` directory:
+
+```bash
+terraform init
+terraform validate
+terraform plan
+```
+
+Review the plan carefully before making any infrastructure changes. Do not run `terraform apply` unless you understand the proposed changes and associated AWS costs.
+
+**Security notes**
+- Terraform state files and backups are excluded from version control.
+- Do not commit AWS credentials, private keys, or real secret-bearing variable files.
+- Review IAM permissions and GitHub OIDC trust conditions before reusing this configuration.
+- The SSH public key path in `key-pair.tf` must be configured for the environment where Terraform runs.
 
 ## Technologies Used
 
