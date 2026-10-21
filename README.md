@@ -132,6 +132,12 @@ docker rm -f my-web
 - Introduce an Application Load Balancer and Auto Scaling Group.
 - Add automated application tests and deployment approval controls.
 
+## Project Screenshots
+
+### GitHub Actions CI/CD Pipeline
+
+![Successful GitHub Actions pipeline](screenshots/github-actions-success.png)
+
 ## Author
 
 **Mohamed Emad Elgendy**
